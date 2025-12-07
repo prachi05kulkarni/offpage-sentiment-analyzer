@@ -1,0 +1,10 @@
+streamlit>=1.20.0
+praw>=7.6.0
+transformers>=4.30.0
+torch
+beautifulsoup4
+requests
+scikit-learn
+python-dotenv
+vaderSentiment
+serpapi
