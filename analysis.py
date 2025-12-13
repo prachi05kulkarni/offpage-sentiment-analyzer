@@ -1,69 +1,99 @@
 import logging
-from sklearn.feature_extraction.text import CountVectorizer
+import re
+from collections import defaultdict
 
 logger = logging.getLogger("analysis")
 
-def compute_share_of_voice(reddit_items, quora_items, brand, competitor=None):
+
+def _word_match(term, text):
+    """Return True if `term` exists as a word in `text` (case-insensitive)."""
+    if not term:
+        return False
     try:
-        brand_lc = brand.lower()
+        # use word boundary to avoid partial matches (e.g., apple != pineapple)
+        return re.search(rf"\b{re.escape(term)}\b", (text or "").lower(), flags=re.IGNORECASE) is not None
     except Exception:
-        brand_lc = str(brand).lower()
+        return term.lower() in (text or "").lower()
 
-    comp_lc = competitor.lower() if competitor else None
 
-    r_brand = sum(1 for it in (reddit_items or []) if brand_lc in (it.get("text", "") or "").lower())
-    q_brand = sum(1 for it in (quora_items or []) if brand_lc in (it.get("text", "") or "").lower())
-    brand_total = r_brand + q_brand
+def compute_share_of_voice(reddit_items, quora_items, brand, competitor=None):
+    """
+    Compute share of voice with robust word-boundary matching.
 
-    if competitor:
-        r_comp = sum(1 for it in (reddit_items or []) if comp_lc in (it.get("text", "") or "").lower())
-        q_comp = sum(1 for it in (quora_items or []) if comp_lc in (it.get("text", "") or "").lower())
-        comp_total = r_comp + q_comp
-    else:
-        comp_total = 0
+    Returns a dict containing:
+      - brand_only_mentions: count of mentions that contain brand but not competitor
+      - competitor_only_mentions: count of mentions that contain competitor but not brand
+      - both_mentions: mentions that include both terms
+      - neither_mentions
+      - brand_mentions: inclusive count (brand_only + both)
+      - competitor_mentions: inclusive count (competitor_only + both)
+      - share_of_voice: inclusive (brand / (brand + competitor)) when denom>0
+      - share_of_voice_exclusive: exclusive (brand_only / (brand_only + competitor_only)) when denom_excl>0
+      - per_platform: breakdown of counts per platform
+    """
+    try:
+        brand_norm = (brand or "").strip().lower()
+    except Exception:
+        brand_norm = str(brand or "").strip().lower()
 
-    denom = brand_total + comp_total
+    comp_norm = (competitor or "").strip().lower() if competitor else None
+
+    all_items = list((reddit_items or []) + (quora_items or []))
+
+    brand_only = 0
+    comp_only = 0
+    both = 0
+    neither = 0
+
+    per_platform = defaultdict(lambda: {"brand_only": 0, "comp_only": 0, "both": 0, "neither": 0})
+
+    for it in all_items:
+        text = (it.get("text") or "") or ""
+        # Prefer matched_terms if already present (clients will set this)
+        matched = it.get("matched_terms")
+        if matched is None:
+            has_brand = _word_match(brand_norm, text)
+            has_comp = _word_match(comp_norm, text) if comp_norm else False
+        else:
+            # matched_terms may contain original-cased brand names; normalize by presence flags
+            has_brand = "brand" in matched or any(m.lower() == brand_norm for m in matched)
+            has_comp = False
+            if comp_norm:
+                has_comp = "competitor" in matched or any(m.lower() == comp_norm for m in matched)
+
+        platform = it.get("platform", "unknown")
+
+        if has_brand and not has_comp:
+            brand_only += 1
+            per_platform[platform]["brand_only"] += 1
+        elif has_comp and not has_brand:
+            comp_only += 1
+            per_platform[platform]["comp_only"] += 1
+        elif has_brand and has_comp:
+            both += 1
+            per_platform[platform]["both"] += 1
+        else:
+            neither += 1
+            per_platform[platform]["neither"] += 1
+
+    brand_inclusive = brand_only + both
+    comp_inclusive = comp_only + both
+
+    denom_inclusive = brand_inclusive + comp_inclusive
+    denom_exclusive = brand_only + comp_only
+
     sov = {
-        "brand_mentions": brand_total,
-        "competitor_mentions": comp_total,
-        "share_of_voice": (brand_total / denom) if denom > 0 else None
+        "brand_only_mentions": brand_only,
+        "competitor_only_mentions": comp_only,
+        "both_mentions": both,
+        "neither_mentions": neither,
+        # backward-compatible keys:
+        "brand_mentions": brand_inclusive,
+        "competitor_mentions": comp_inclusive,
+        "share_of_voice": (brand_inclusive / denom_inclusive) if denom_inclusive > 0 else None,
+        # exclusive SOV excludes overlap (both) from denominator:
+        "share_of_voice_exclusive": (brand_only / denom_exclusive) if denom_exclusive > 0 else None,
+        "per_platform": per_platform,
     }
     logger.debug("SOV computed: %s", sov)
     return sov
-
-def top_threads(items, top_n=5):
-    scored = []
-    for it in (items or []):
-        try:
-            score = float(it.get("score", 0) or 0)
-            comments = float(it.get("comments", 0) or 0)
-            s = 0.6 * score + 0.4 * comments
-            if s == 0:
-                s = len((it.get("text", "") or ""))
-            entry = it.copy()
-            entry["score"] = s
-            scored.append(entry)
-        except Exception as e:
-            logger.debug("Error scoring item: %s", e)
-    scored.sort(key=lambda x: x.get("score", 0), reverse=True)
-    return scored[:top_n]
-
-def generate_recommendations(items, brand, top_n_keywords=8):
-    texts = [it.get("text", "") for it in (items or []) if it.get("text")]
-    if not texts:
-        return ["No mentions found — consider starting brand conversations and monitoring communities."]
-    try:
-        cv = CountVectorizer(stop_words="english", max_features=top_n_keywords)
-        X = cv.fit_transform(texts)
-        keywords = cv.get_feature_names_out().tolist()
-    except Exception as e:
-        logger.debug("Keyword extraction failed: %s", e)
-        keywords = []
-    recs = []
-    if keywords:
-        recs.append(f"Top topics/keywords observed: {', '.join(keywords)}")
-    recs.append("Include: quick responses on threads with complaints and helpful how-to content.")
-    recs.append("Exclude: overt sales pitches. Focus on value and solutions.")
-    recs.append("Tone: empathetic on negative clusters; amplify positive user stories.")
-    recs.append("Monitoring: set up alerts for spikes and weekly digest for teams.")
-    return recs

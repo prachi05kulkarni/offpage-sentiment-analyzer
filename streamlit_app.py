@@ -1,93 +1,226 @@
-import os
-import logging
-import traceback
+# streamlit_app.py
+
+from typing import List, Dict
 import streamlit as st
-from dotenv import load_dotenv
+import pandas as pd
 
-load_dotenv()
-
-from reddit_client import fetch_reddit_mentions
-from quora_client import fetch_quora_mentions
-from sentiment import analyze_sentiments
-from analysis import compute_share_of_voice, top_threads, generate_recommendations
-from utils import read_processed_jsonl_if_exists
-
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("app")
+from data_connectors import (
+    fetch_reddit_mentions_for_brand,
+    fetch_quora_mentions_for_brand,
+    find_sentiment_fn,
+)
+from analytics_visuals import render_share_of_voice, render_sentiment_cards
 
 st.set_page_config(page_title="Offpage Sentiment Analyzer", layout="wide")
-st.title("Offpage Sentiment Analyzer — Reddit & Quora")
+st.title("Offpage Sentiment Analyzer")
 
-# Sidebar / inputs
+# Sidebar diagnostics and controls
+if "logs" not in st.session_state:
+    st.session_state["logs"] = []
+
+def log(msg: str):
+    st.session_state["logs"].append(msg)
+    st.session_state["logs"] = st.session_state["logs"][-300:]
+
 with st.sidebar:
-    st.header("Settings")
-    brand = st.text_input("Brand name", value="", help="Brand to analyze (required)")
-    competitor = st.text_input("Competitor (optional)", value="", help="Competitor for SOV")
-    days = st.slider("Lookback days (historical search)", min_value=1, max_value=90, value=14)
-    use_streamed = st.checkbox("Show processed streamed mentions (if running stream worker)", value=True)
-    run_btn = st.button("Run analysis")
+    st.header("Diagnostics")
+    if st.button("Clear logs"):
+        st.session_state["logs"] = []
+    for line in st.session_state["logs"][-200:]:
+        st.text(line)
+    st.markdown("---")
+    st.markdown("Notes:")
+    st.markdown("- Make sure reddit_client.py (and optional quora_client.py / sentiment.py) are next to this file.")
+    st.markdown("- If you want better sentiment, add a sentiment.py with a `predict(text|list)` function.")
 
-if run_btn:
+# Form input
+with st.form("analyze"):
+    brand = st.text_input("Your Brand (required)", placeholder="e.g., Pond's")
+    competitors = st.text_input("Competitors (comma-separated, optional)", placeholder="Nivea, Garnier")
+    limit = st.number_input("Max mentions per brand/platform", value=200, min_value=10, max_value=1000)
+    submitted = st.form_submit_button("Analyze")
+
+if not submitted:
+    st.info("Enter brand + (optional) competitors and press Analyze.")
+else:
     if not brand.strip():
-        st.error("Please enter a brand name to proceed.")
+        st.warning("Please enter a brand.")
     else:
-        try:
-            with st.spinner("Fetching historical Reddit mentions..."):
-                reddit_items = fetch_reddit_mentions(brand.strip(), competitor.strip() or None, days=days)
-            with st.spinner("Fetching Quora mentions..."):
-                quora_items = fetch_quora_mentions(brand.strip(), competitor.strip() or None, days=days)
+        brands = [brand.strip()] + [c.strip() for c in competitors.split(",") if c.strip()]
+        st.write("Analyzing:", ", ".join(brands))
+        
+        # Check for mock warning
+        if st.session_state.get("mock_warning_shown"):
+             st.warning("⚠️ **DEMO MODE**: Reddit credentials are missing and public fetch is blocked. Displaying **MOCK DATA** for Reddit. Quora data may still be real if key is valid.")
+        # try to find sentiment function (if provided)
+        sentiment_fn = find_sentiment_fn()
+        if sentiment_fn:
+            log(f"Using sentiment function: {getattr(sentiment_fn, '__name__', str(sentiment_fn))}")
+        else:
+            log("No sentiment module found — using simple lexicon fallback (built-in).")
 
-            all_items = {"reddit (historical)": reddit_items or [], "quora": quora_items or []}
+        # fetch mentions and compute sentiment
+        sov_results: List[Dict] = []
+        sentiment_results: List[Dict] = []
 
-            st.subheader("Raw mentions count (historical)")
-            st.write({k: len(v) for k, v in all_items.items()})
+        # Keep sample mentions for debugging
+        sample_mentions = {}
 
-            st.subheader("Sentiment analysis (historical)")
-            for platform, items in all_items.items():
-                texts = [it.get("text", "") for it in items if it.get("text")]
-                if not texts:
-                    st.info(f"No {platform} mentions found")
-                    continue
-                sentiments = analyze_sentiments(texts)
-                pos = sum(1 for s in sentiments if s.get("label", "").lower().startswith("pos"))
-                neg = sum(1 for s in sentiments if s.get("label", "").lower().startswith("neg"))
-                neu = len(sentiments) - pos - neg
-                st.write(f"{platform}: +{pos} / -{neg} / neutral:{neu}")
-                st.bar_chart({"positive": pos, "negative": neg, "neutral": neu})
+        for b in brands:
+            st.write(f"Fetching for {b} ...")
+            # Ensure brand passed as str
+            b_str = str(b).strip()
 
-            st.subheader("Share of Voice (historical)")
-            sov = compute_share_of_voice(reddit_items, quora_items, brand.strip(), competitor.strip() or None)
-            st.json(sov)
+            # Fetch per-brand (fresh lists)
+            reddit_mentions = fetch_reddit_mentions_for_brand(b_str, limit)
+            quora_mentions = fetch_quora_mentions_for_brand(b_str, limit)
 
-            st.subheader("Top threads (historical)")
-            for platform, items in all_items.items():
-                st.write(platform.upper())
-                for item in top_threads(items, top_n=5):
-                    title = item.get("title") or (item.get("text") or "")[:80]
-                    url = item.get("url", "")
-                    comments = item.get("comments", 0)
-                    score = item.get("score", 0)
-                    if url:
-                        st.markdown(f"- [{title}]({url}) — score:{score} comments:{comments}")
+            # Defensive: coerce to lists
+            if not isinstance(reddit_mentions, list):
+                log(f"[WARN] reddit fetch for '{b_str}' returned non-list; coerced to empty.")
+                reddit_mentions = []
+            if not isinstance(quora_mentions, list):
+                log(f"[WARN] quora fetch for '{b_str}' returned non-list; coerced to empty.")
+                quora_mentions = []
+
+            log(f"{b_str}: reddit={len(reddit_mentions)}, quora={len(quora_mentions)}")
+
+            # store sample for debugging
+            sample_mentions[b_str] = {
+                "reddit_sample": reddit_mentions[:3],
+                "quora_sample": quora_mentions[:3],
+            }
+
+            # build text list for sentiment prediction (prefer sentiment_fn)
+            texts: List[str] = []
+            text_meta: List[tuple] = []  # (platform, raw_mention)
+            for m in reddit_mentions:
+                texts.append((m.get("text") or m.get("title") or "").strip())
+                text_meta.append(("reddit", m))
+            for m in quora_mentions:
+                texts.append((m.get("text") or m.get("title") or "").strip())
+                text_meta.append(("quora", m))
+
+            # compute labels
+            labels: List[str] = []
+            if sentiment_fn and texts:
+                try:
+                    # attempt batch call first
+                    res = sentiment_fn(texts) if callable(sentiment_fn) else None
+                    if isinstance(res, list) and len(res) == len(texts):
+                        labels = [str(x).lower() for x in res]
                     else:
-                        st.markdown(f"- {title} — score:{score} comments:{comments}")
+                        # fallback to per-text calls
+                        labels = [str(sentiment_fn(t)).lower() for t in texts]
+                except Exception as e:
+                    log(f"Sentiment function error: {e}")
+                    labels = []
 
-            st.subheader("Recommendations (historical)")
-            recs = generate_recommendations(reddit_items + quora_items, brand.strip())
-            for r in recs:
-                st.markdown(f"- {r}")
+            if not labels and texts:
+                # lexicon fallback (simple)
+                POS = {
+                    "good",
+                    "great",
+                    "love",
+                    "excellent",
+                    "best",
+                    "amazing",
+                    "happy",
+                    "like",
+                    "awesome",
+                    "positive",
+                    "win",
+                    "improve",
+                    "liked",
+                    "recommend",
+                }
+                NEG = {
+                    "bad",
+                    "terrible",
+                    "hate",
+                    "awful",
+                    "worst",
+                    "angry",
+                    "disappointed",
+                    "poor",
+                    "negative",
+                    "problem",
+                    "issue",
+                    "complain",
+                    "complaint",
+                    "risk",
+                    "scam",
+                }
+                for t in texts:
+                    lower = (t or "").lower()
+                    p = sum(1 for w in POS if w in lower)
+                    n = sum(1 for w in NEG if w in lower)
+                    if p > n:
+                        labels.append("positive")
+                    elif n > p:
+                        labels.append("negative")
+                    else:
+                        labels.append("neutral")
 
-            # Optionally show streamed processed mentions (near-real-time) if available
-            if use_streamed:
-                processed = read_processed_jsonl_if_exists()
-                if processed:
-                    st.subheader("Processed streamed mentions (recent)")
-                    st.write(f"Showing up to latest {min(200, len(processed))} items")
-                    st.dataframe(processed[:200])
+            # aggregate counts
+            reddit_counts = {"positive": 0, "neutral": 0, "negative": 0}
+            quora_counts = {"positive": 0, "neutral": 0, "negative": 0}
+            for (plat, _m), lbl in zip(text_meta, labels):
+                l = lbl.lower() if isinstance(lbl, str) else "neutral"
+                if "pos" in l:
+                    lab = "positive"
+                elif "neg" in l:
+                    lab = "negative"
                 else:
-                    st.info("No processed streamed mentions found (run the stream worker and processor).")
+                    lab = "neutral"
+                if plat == "reddit":
+                    reddit_counts[lab] += 1
+                else:
+                    quora_counts[lab] += 1
 
-        except Exception as e:
-            logger.error("Unhandled exception in main flow: %s", traceback.format_exc())
-            st.error(f"Analysis failed: {e}. Check logs for details.")
+            sov_results.append({"brand": b_str, "reddit": len(reddit_mentions), "quora": len(quora_mentions)})
+            sentiment_results.append({"brand": b_str, "reddit": reddit_counts, "quora": quora_counts})
+
+        # --- DEBUG: show raw SOV structure to sidebar and validate ---
+        st.sidebar.markdown("### SOV raw data (debug)")
+        st.sidebar.json(sov_results)
+
+        # Convert to DataFrame and coerce numeric types before plotting
+        df_sov = pd.DataFrame(sov_results).fillna(0)
+        # Defensive column checks
+        if not {"brand", "reddit", "quora"}.issubset(set(df_sov.columns)):
+            st.error("SOV data missing expected columns (brand, reddit, quora). See sidebar debug JSON.")
+            log("SOV data missing expected columns; aborting render.")
+        else:
+            # ensure numeric
+            df_sov["reddit"] = pd.to_numeric(df_sov["reddit"], errors="coerce").fillna(0).astype(int)
+            df_sov["quora"] = pd.to_numeric(df_sov["quora"], errors="coerce").fillna(0).astype(int)
+
+            # Show DataFrame in-app for quick inspection (helps pinpoint identical distributions)
+            st.write("SOV DataFrame (debug):")
+            st.dataframe(df_sov)
+
+            # Detect identical distributions (every brand has same counts) and warn
+            reddit_unique = df_sov["reddit"].nunique()
+            quora_unique = df_sov["quora"].nunique()
+            if reddit_unique == 1 and quora_unique == 1:
+                st.warning(
+                    "All brands currently have identical Reddit & Quora counts. "
+                    "This usually means the fetch function returned identical results for each brand or the query wasn't applied per-brand.\n"
+                    "Check the sidebar 'SOV raw data' and the sample mentions below."
+                )
+                # show sample mentions per brand to help debug
+                st.sidebar.markdown("### Sample mentions (first 3 per brand)")
+                for br, samp in sample_mentions.items():
+                    st.sidebar.markdown(f"**{br}**")
+                    st.sidebar.markdown("Reddit sample:")
+                    st.sidebar.json(samp["reddit_sample"])
+                    st.sidebar.markdown("Quora sample:")
+                    st.sidebar.json(samp["quora_sample"])
+
+            # show visuals using cleaned sov_results
+            cleaned_sov = df_sov.to_dict(orient="records")
+            render_share_of_voice(cleaned_sov)
+
+            st.markdown("---")
+            render_sentiment_cards(sentiment_results)

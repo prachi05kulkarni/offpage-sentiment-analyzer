@@ -1,0 +1,44 @@
+version: "3.8"
+services:
+  app:
+    build: .
+    command: bash -lc "source .env && streamlit run streamlit_app.py --server.port=8501 --server.address=0.0.0.0"
+    environment:
+      - REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID}
+      - REDDIT_CLIENT_SECRET=${REDDIT_CLIENT_SECRET}
+      - REDDIT_USER_AGENT=${REDDIT_USER_AGENT}
+      - SERPAPI_KEY=${SERPAPI_KEY}
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      - USE_HF=${USE_HF}
+      - HF_SENTIMENT_MODEL=${HF_SENTIMENT_MODEL}
+      - LOG_LEVEL=${LOG_LEVEL}
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./:/app
+
+  stream_worker:
+    build: .
+    command: bash -lc "source .env && python -u stream_processor.py"
+    environment:
+      - STREAMED_PATH=${STREAMED_PATH}
+      - PROCESSED_PATH=${PROCESSED_PATH}
+      - REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID}
+      - REDDIT_CLIENT_SECRET=${REDDIT_CLIENT_SECRET}
+      - REDDIT_USER_AGENT=${REDDIT_USER_AGENT}
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      - LOG_LEVEL=${LOG_LEVEL}
+    volumes:
+      - ./:/app
+
+  reddit_stream:
+    build: .
+    command: bash -lc "source .env && python -u -c \"from reddit_stream import start_submission_stream; start_submission_stream('${STREAM_BRAND}')\""
+    environment:
+      - REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID}
+      - REDDIT_CLIENT_SECRET=${REDDIT_CLIENT_SECRET}
+      - REDDIT_USER_AGENT=${REDDIT_USER_AGENT}
+      - STREAMED_PATH=${STREAMED_PATH}
+      - LOG_LEVEL=${LOG_LEVEL}
+    volumes:
+      - ./:/app
