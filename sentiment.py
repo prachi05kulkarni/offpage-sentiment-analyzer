@@ -71,9 +71,20 @@ def _normalize_label(label: str) -> str:
         return "NEGATIVE"
     if lab.startswith("NEU"):
         return "NEUTRAL"
+    
+    # Handle standard HuggingFace label formats for SST-2
+    if lab == "LABEL_1":
+        return "POSITIVE"
+    if lab == "LABEL_0":
+        return "NEGATIVE"
+        
     # Some models use 0/1 mapping; handle generically
     if lab in ("0", "1"):
-        # don't assume mapping here; caller may provide id2label mapping
+        # simple heuristic for binary classification often 0=neg, 1=pos
+        if lab == "1":
+            return "POSITIVE"
+        if lab == "0":
+            return "NEGATIVE"
         return lab
     return lab
 
@@ -177,3 +188,34 @@ def analyze_sentiment(text: str) -> Dict:
     """
     out = analyze_sentiments([text], batch_size=1)
     return out[0] if out else {"label": "NEUTRAL", "score": 0.0}
+
+
+def predict(texts):
+    """
+    Wrapper to handle both single text and list of texts.
+    Returns list of label strings for compatibility with streamlit_app.py.
+    
+    This is the primary function used by data_connectors.find_sentiment_fn()
+    """
+    # Handle single string input
+    if isinstance(texts, str):
+        result = analyze_sentiments([texts])
+        return [r.get("label", "NEUTRAL") for r in result]
+    
+    # Handle list of strings
+    if isinstance(texts, list):
+        # Filter out any non-string items and ensure we have clean strings
+        clean_texts = []
+        for t in texts:
+            if isinstance(t, str):
+                clean_texts.append(t)
+            elif t is not None:
+                clean_texts.append(str(t))
+            else:
+                clean_texts.append("")
+        
+        result = analyze_sentiments(clean_texts)
+        return [r.get("label", "NEUTRAL") for r in result]
+    
+    # Fallback for unexpected input types
+    return ["NEUTRAL"]

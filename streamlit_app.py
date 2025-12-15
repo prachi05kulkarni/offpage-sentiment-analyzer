@@ -3,6 +3,10 @@
 from typing import List, Dict
 import streamlit as st
 import pandas as pd
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 from data_connectors import (
     fetch_reddit_mentions_for_brand,
